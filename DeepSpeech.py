@@ -78,38 +78,78 @@ def dense(name, x, units, dropout_rate=None, relu=True):
     return output
 
 
-def rnn_impl_lstmblockfusedcell(x, seq_length, previous_state, reuse):
+def get_cell_type():
+    if FLAGS.rnn_cell == 'lstm':
+        return tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell
+
+    if FLAGS.rnn_cell == 'gru':
+        return tf.contrib.cudnn_rnn.CudnnCompatibleGRUCell
+
+    log_error('Invalid RNN cell type: {}'.format(FLAGS.rnn_cell))
+    exit(1)
+
+
+def rnn_impl_cudnn_rnn(x, seq_length, previous_state, _):
+    assert previous_state is None # 'Passing previous state not supported with CuDNN backend'
+
+    cell_type = get_cell_type()
+
     # Forward direction cell:
-    fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
+    fw_cell = cell_type(num_layers=FLAGS.n_layers,
+                        num_units=Config.n_cell_dim,
+                        input_mode='linear_input',
+                        direction='unidirectional',
+                        dtype=tf.float32)
 
     output, output_state = fw_cell(inputs=x,
-                                   dtype=tf.float32,
-                                   sequence_length=seq_length,
-                                   initial_state=previous_state)
+                                   sequence_lengths=seq_length)
+
+    return output, output_state
+
+
+def rnn_impl_dynamic_rnn(x, seq_length, previous_state, reuse):
+    cell_type = get_cell_type()
+
+    with tf.variable_scope('cudnn_lstm'):
+        # Forward direction cell:
+        def cell():
+            return cell_type(Config.n_cell_dim, reuse=reuse)
+        fw_cell = tf.nn.rnn_cell.MultiRNNCell([cell() for _ in range(FLAGS.n_layers)])
+
+        output, output_state = tf.nn.dynamic_rnn(cell=fw_cell,
+                                                 inputs=x,
+                                                 sequence_length=seq_length,
+                                                 initial_state=previous_state,
+                                                 dtype=tf.float32,
+                                                 time_major=True)
 
     return output, output_state
 
 
 def rnn_impl_static_rnn(x, seq_length, previous_state, reuse):
-    # Forward direction cell:
-    fw_cell = tf.nn.rnn_cell.LSTMCell(Config.n_cell_dim, reuse=reuse)
+    cell_type = get_cell_type()
 
-    # Split rank N tensor into list of rank N-1 tensors
-    x = [x[l] for l in range(x.shape[0])]
+    with tf.variable_scope('cudnn_lstm'):
+        # Forward direction cell:
+        def cell():
+            return cell_type(Config.n_cell_dim, reuse=reuse)
+        fw_cell = tf.nn.rnn_cell.MultiRNNCell([cell() for _ in range(FLAGS.n_layers)])
 
-    # We parametrize the RNN implementation as the training and inference graph
-    # need to do different things here.
-    output, output_state = tf.nn.static_rnn(cell=fw_cell,
-                                            inputs=x,
-                                            initial_state=previous_state,
-                                            dtype=tf.float32,
-                                            sequence_length=seq_length)
-    output = tf.concat(output, 0)
+        # Split rank N tensor into list of rank N-1 tensors
+        x = [x[l] for l in range(x.shape[0])]
+
+        output, output_state = tf.nn.static_rnn(cell=fw_cell,
+                                                inputs=x,
+                                                sequence_length=seq_length,
+                                                initial_state=previous_state,
+                                                dtype=tf.float32)
+
+        output = tf.concat(output, 0)
 
     return output, output_state
 
 
-def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockfusedcell):
+def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_dynamic_rnn):
     layers = {}
 
     # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
@@ -183,8 +223,13 @@ def calculate_mean_edit_distance_and_loss(iterator, dropout, reuse):
     # Obtain the next batch of data
     (batch_x, batch_seq_len), batch_y = iterator.get_next()
 
+    if FLAGS.use_cudnn_rnn:
+        rnn_impl = rnn_impl_cudnn_rnn
+    else:
+        rnn_impl = rnn_impl_dynamic_rnn
+
     # Calculate the logits of the batch
-    logits, _ = create_model(batch_x, batch_seq_len, dropout, reuse=reuse)
+    logits, _ = create_model(batch_x, batch_seq_len, dropout, reuse=reuse, rnn_impl=rnn_impl)
 
     # Compute the CTC loss using TensorFlow's `ctc_loss`
     total_loss = tfv1.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
@@ -573,27 +618,26 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
 
     if batch_size <= 0:
         # no state management since n_step is expected to be dynamic too (see below)
-        previous_state = previous_state_c = previous_state_h = None
+        previous_state = None
     else:
-        previous_state_c = tfv1.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_c')
-        previous_state_h = tfv1.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_h')
+        previous_state_c = (tfv1.placeholder(tf.float32, [batch_size, Config.n_cell_dim],
+                                             name='previous_state_c{}'.format(i if i > 0 else ''))
+                            for i in range(FLAGS.n_layers))
+        previous_state_h = (tfv1.placeholder(tf.float32, [batch_size, Config.n_cell_dim],
+                                             name='previous_state_h{}'.format(i if i > 0 else ''))
+                            for i in range(FLAGS.n_layers))
 
-        previous_state = tf.contrib.rnn.LSTMStateTuple(previous_state_c, previous_state_h)
+        previous_state = tuple(tf.contrib.rnn.LSTMStateTuple(c, h) for c, h in zip(previous_state_c, previous_state_h))
 
     # One rate per layer
     no_dropout = [None] * 6
-
-    if tflite:
-        rnn_impl = rnn_impl_static_rnn
-    else:
-        rnn_impl = rnn_impl_lstmblockfusedcell
 
     logits, layers = create_model(batch_x=input_tensor,
                                   seq_length=seq_length if not FLAGS.export_tflite else None,
                                   dropout=no_dropout,
                                   previous_state=previous_state,
                                   overlap=False,
-                                  rnn_impl=rnn_impl)
+                                  rnn_impl=rnn_impl_static_rnn)
 
     # TF Lite runtime will check that input dimensions are 1, 2 or 4
     # by default we get 3, the middle one being batch_size which is forced to
@@ -620,10 +664,6 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
             layers
         )
 
-    new_state_c, new_state_h = layers['rnn_output_state']
-    new_state_c = tf.identity(new_state_c, name='new_state_c')
-    new_state_h = tf.identity(new_state_h, name='new_state_h')
-
     inputs = {
         'input': input_tensor,
         'previous_state_c': previous_state_c,
@@ -636,10 +676,15 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
 
     outputs = {
         'outputs': logits,
-        'new_state_c': new_state_c,
-        'new_state_h': new_state_h,
         'mfccs': mfccs,
     }
+
+    new_states = layers['rnn_output_state']
+    for i, (new_c, new_h) in enumerate(new_states):
+        new_c = tf.identity(new_c, name='new_state_c{}'.format(i if i > 0 else ''))
+        outputs[new_c.name] = new_c
+        new_h = tf.identity(new_h, name='new_state_h{}'.format(i if i > 0 else ''))
+        outputs[new_h.name] = new_h
 
     return inputs, outputs, layers
 
@@ -660,14 +705,14 @@ def export():
     output_names = ",".join(output_names_tensors + output_names_ops)
 
     mapping = None
-    if FLAGS.export_tflite:
+    if FLAGS.export_tflite or FLAGS.use_cudnn_rnn:
         # Create a saver using variables from the above newly created graph
         # Training graph uses LSTMFusedCell, but the TFLite inference graph uses
         # a static RNN with a normal cell, so we need to rewrite the names to
         # match the training weights when restoring.
         def fixup(name):
             if name.startswith('rnn/lstm_cell/'):
-                return name.replace('rnn/lstm_cell/', 'lstm_fused_cell/')
+                return name.replace('rnn/lstm_cell/', 'rnn/cudnn_compatible_lstm_cell/')
             return name
 
         mapping = {fixup(v.op.name): v for v in tf.global_variables()}
